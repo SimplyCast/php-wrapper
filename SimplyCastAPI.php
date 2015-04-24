@@ -267,7 +267,7 @@ class API {
    * @return string The raw response from the API.
    */
   private function _fsockRequest($httpMethod, $headers, $resource, $queryParameters, $data) {
-    $apiURL = $this->apiURL;
+    $host = $apiURL = $this->apiURL;
     $base = '';
     if (strpos($apiURL, '/')) {
       list($host, $base) = explode('/', $apiURL, 2);
