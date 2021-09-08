@@ -143,22 +143,30 @@ class API {
    *   DELETE).
    * @param string $resource        The resource that is going to be called.
    * @param array  $queryParameters A key / value array of query parameters 
-   *   (will be urlencoded automatically.
+   *                                (will be urlencoded automatically.)
    * @param string $data            The data to send along with the request. 
-   *   This must be an array of request body data ready to be JSON encoded, 
-   *   or a JSON string. Also, is only applicable for POST requests.
-   *
+   *                                This must be an array of request body data ready to be JSON encoded, 
+   *                                or a JSON string. Also, is only applicable for POST requests.
+   * @param bool   $octetStream     Defaults to false. Flag to indicate content type.
+   * 
    * @return array An array of response data, containing status & status code,
    *   the decoded response, headers and the raw response.
    */
-  public function request($httpMethod, $resource, $queryParameters = array(), $data = false) {
+  public function request(
+      $httpMethod, 
+      $resource, 
+      $queryParameters = array(), 
+      $data = false, 
+      bool $octetStream = false
+  ) {
     if ($this->authScheme == 'basic') {
       $authStr = 'Basic ' . base64_encode("{$this->keys['public']}:{$this->keys['secret']}");
     }
 
+    $acceptFormat = ($octetStream && $httpMethod === 'GET') ? 'octet-stream' : 'json';
     $headers = array(
       "Connection: close",
-      "Accept: application/json",
+      "Accept: application/$acceptFormat",
       "Authorization: $authStr",
     );
 
@@ -172,7 +180,7 @@ class API {
       $queryParameters = '';
     }
     
-    if ($httpMethod == 'POST') {
+    if ($httpMethod == 'POST' || $httpMethod == 'PUT') {
       if (is_array($data)) {
         $data = json_encode($data);
       }
@@ -180,7 +188,8 @@ class API {
       $data = trim($data);
 
       if (strlen($data) > 0) {
-        $headers[] = 'Content-Type: application/json';
+        $contentFormat = ($octetStream && $httpMethod === 'PUT') ? 'octet-stream' : 'json';
+        $headers[] = 'Content-Type: application/'.$contentFormat;
         $headers[] = 'Content-Length: ' . strlen($data);
       }
     } else {
@@ -191,7 +200,7 @@ class API {
     if ($this->lib == 'curl' && function_exists('curl_init')) {
       $content = $this->_curlRequest($httpMethod, $headers, $resource, $queryParameters, $data);
     } else {
-      $content = $this->_fsockRequest($httpMethod, $headers, $resource, $queryParameters, $data);
+      $content = $this->_socketRequest($httpMethod, $headers, $resource, $queryParameters, $data);
     }
 
     $response = self::_decodeResponse($content);
@@ -213,7 +222,7 @@ class API {
 
     if ($response['code'] == 204) {
       return null;
-    } else if ($response['code'] < 400 && is_array($response['response'])) {
+    } else if ($response['code'] < 400) {
       return $response['response'];
     } else {  
       return false;
@@ -245,7 +254,7 @@ class API {
         )
     );
 
-    if ($httpMethod == 'POST' && $data) {
+    if (($httpMethod == 'POST' || $httpMethod == 'PUT') && $data) {
       curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
     }
 
@@ -266,7 +275,7 @@ class API {
    *
    * @return string The raw response from the API.
    */
-  private function _fsockRequest($httpMethod, $headers, $resource, $queryParameters, $data) {
+  private function _socketRequest($httpMethod, $headers, $resource, $queryParameters, $data) {
     $host = $apiURL = $this->apiURL;
     $base = '';
     if (strpos($apiURL, '/')) {
@@ -278,7 +287,7 @@ class API {
     $port = 80;
     if ($this->useTLS) {
       $port = 443;
-      $url = "tls://$host";
+      $url = "ssl://$host";
     } else {
       $url = "tcp://$host";
     }
@@ -289,7 +298,7 @@ class API {
     
     $content = '';
     
-    $resource = fsockopen($url, $port, $errno, $errstr);
+    $resource = stream_socket_client($url . ":" . $port, $errno, $errstr);
     if (!$resource) {
       return false;
     }
@@ -315,17 +324,30 @@ class API {
       return false;
     }
 
-    list($headers, $contentBody) = explode("\r\n\r\n", $content, 2);
+    // If the initial response is an empty 100 response, ignore initial response
+    if (substr($content, 0, 12) === "HTTP/1.1 100") {
+      list($fauxHeader, $headers, $contentBody) = explode("\r\n\r\n", $content, 3);
+    } else {
+      list($headers, $contentBody) = explode("\r\n\r\n", $content, 2);
+    }
+
     $headers = explode("\r\n", $headers);
     $statusLine = array_shift($headers);
 
     list($protocol, $code, $status) = explode(' ', $statusLine, 3);
 
+    $responseData = false;
+    if (in_array('Content-Type: application/octet-stream', $headers)) {
+      $responseData = self::decodeChunks($contentBody);
+    } else if (strlen(trim($contentBody)) > 0) {
+      $responseData = json_decode(self::decodeChunks($contentBody), true);
+    }
+
     $response = array(
       'code'     => $code, 
       'status'   => $status,
       'headers'  => $headers,
-      'response' => strlen(trim($contentBody)) > 0 ? json_decode(self::decodeChunks($contentBody), true) : false,
+      'response' => $responseData,
       'raw'      => $content,
     );
 
@@ -699,6 +721,52 @@ class ContactManager extends APIResource {
   }
 
   /**
+   * Create a batch of contacts.
+   *
+   * @param array  $contacts    The contacts to add to the contact batch.
+   * @param string $mergeColumn The merge column used to check if any contacts already exist.
+   * @param int    $listId      The list the contacts will be added to.
+   *
+   * @return int The batch process ID
+   */
+  public function createContactBatch($contacts, $mergeColumn, $listId) {
+    $formatted = array();
+    foreach ($contacts as $contact) {
+      if (is_scalar($contact)) {
+        $contact = array($contact);
+      }
+      $formatted[] = array('contact' => array('fields' => $contact, 'lists' => array($listId)));
+    }
+    $params = array('mergeColumn' => $mergeColumn);
+    $this->request("POST", "contactmanager/contacts/batch", $params, $formatted);
+    $response = $this->_getLastResponse();
+    $batchId = $response['response']['id'];
+    return (int) $batchId;
+  }
+
+  /**
+   * Get the status of a contact batch operation.
+   *
+   * @param int $id The ID of a contact batch operation
+   *
+   * @return array A representation of the contact batch status
+   */
+  public function getContactBatch($id) {
+    return $this->request('GET', "contactmanager/contacts/batch/$id");
+  }
+
+  /**
+   * Get the full result set of a contact batch operation.
+   *
+   * @param int $id The ID of a contact batch operation
+   *
+   * @return array A representation of the contact batch set result
+   */
+  public function getContactBatchResult($id) {
+    return $this->request('GET', "contactmanager/contacts/batch/$id/result");
+  }
+
+  /**
    * Metadata column methods.
    */
 
@@ -941,6 +1009,114 @@ class ContactManager extends APIResource {
     }
     return $this->request('POST', "suppression/$listType", false, array('suppressionEntries' => $entries));
   }
+
+  /**
+   * Contact File Management Methods
+   */
+
+  /**
+   * Retrieves the metadata of a file or directory
+   *
+   * @param int    $contact The Contact's id
+   * @param string $path    The path to the targeted file/directory relative to the contact's file folder.
+   *                        May be an empty string to target entire folder
+   * @param int    $offset  Optional offset to start directory content retrieval at.
+   * @param int    $limit   Optional limit to the number of directory items to return at one time
+   *
+   * @return array An array containing the file/directory's metadata
+   */
+  public function getContactPathMetadata(int $contact, string $path, int $offset = 0, int $limit = 100) {
+    $resource  = "contactmanager/contacts/$contact/files/_/$path";
+    $params = ['offset' => $offset, 'limit' => $limit];
+    return $this->request('GET', $resource, $params);
+  }
+
+  /**
+   * Download the contents of a file
+   *
+   * @param int    $contact The Contact's id
+   * @param string $path    The path to the targeted file relative to the contact's file folder.
+   *
+   * @return string The file's contents
+   */
+  public function downloadContactFile(int $contact, string $path) {
+    $resource  = "contactmanager/contacts/$contact/files/_/$path";
+    return $this->request('GET', $resource, [], false, true);
+  }
+
+  /**
+   * Creates a new directory in the contact's file folder
+   *
+   * @param int    $contact   The Contact's id
+   * @param string $path      The path of the new directory relative to the contact's file folder.
+   * @param bool   $recursive Flag indicating if intermediate directories should be recursively made
+   *
+   * @return array An array containing the new directory's metadata
+   */
+  public function createContactDirectory(int $contact, string $path, bool $recursive = false) {
+    $resource  = "contactmanager/contacts/$contact/files/_/$path";
+    $params = ['recursive' => $recursive];
+    return $this->request('PUT', $resource, $params);
+  }
+
+  /**
+   * Creates a new file in the contact's file folder
+   *
+   * @param int    $contact The Contact's id
+   * @param string $path    The path and name of the new file relative to the contact's file folder.
+   * @param string $body    File Contents as a stream of data
+   * @param bool   $replace Flag indicating if this upload can overwrite an existing file
+   *
+   * @return array An array containing the new directory's metadata
+   */
+  public function uploadContactFile(int $contact, string $path, string $body, bool $replace = false) {
+    $resource  = "contactmanager/contacts/$contact/files/_/$path";
+    $params = ['replace' => $replace];
+    return $this->request('PUT', $resource, $params, $body, true);
+  }
+
+  /**
+   * Renames or Moves a contact file or directory
+   *
+   * @param int    $contact The Contact's id
+   * @param string $path    The current path to the targeted file/directory relative to the contact's file folder.
+   * @param string $newPath The new path to update the file/directory to.
+   * @param bool   $current Flag indicating if the new path value is a name in the file's current directory or 
+   *                        is a path starting from the main directory of the contact.
+   * @param int    $offset  Optional offset to start directory content retrieval at.
+   * @param int    $limit   Optional limit to the number of directory items to return at one time
+   *
+   * @return array An array containing the file/directory's metadata
+   */
+  public function updateContactPath(
+      int $contact, 
+      string $path, 
+      string $newPath, 
+      bool $current, 
+      int $offset = 0, 
+      int $limit = 100
+  ) {
+    $resource  = "contactmanager/contacts/$contact/files/_/$path";
+    $params = ['offset' => $offset, 'limit' => $limit];
+    $name = ($current ? '' : '/').$newPath;
+    $body = ['path' => ['name' => $name]];
+    return $this->request('POST', $resource, $params, $body);
+  }
+
+  /**
+   * Deletes a file/directory in the contact's file folder
+   *
+   * @param int    $contact The Contact's id
+   * @param string $path    The path of the file/directory to delete relative to the contact's file folder.
+   * @param bool   $force   Flag indicating if a directory containing files should be deleted
+   *
+   * @return void
+   */
+  public function deleteContactPath(int $contact, string $path, bool $force = false) {
+    $resource  = "contactmanager/contacts/$contact/files/_/$path";
+    $params = ['force' => $force];
+    $this->request('DELETE', $resource, $params);
+  }
 }
 
 /**
@@ -1091,6 +1267,15 @@ abstract class APIResource {
    */
   protected function request() {
     return call_user_func_array(array($this->apiHandle, 'request'), func_get_args());
+  }
+
+  /**
+   * Pass-thru to the API class' getLastResponse function.
+   *
+   * @return array
+   */
+  protected function _getLastResponse() {
+    return $this->apiHandle->getLastResponse();
   }
 }
 
